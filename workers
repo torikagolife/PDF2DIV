@@ -1,0 +1,332 @@
+export default {
+  async fetch(request, env) {
+    // CORS設定（ブラウザからの通信を許可）
+    const corsHeaders = {
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Methods": "POST, OPTIONS",
+      "Access-Control-Allow-Headers": "Content-Type",
+    };
+
+    if (request.method === "OPTIONS") {
+      return new Response(null, { headers: corsHeaders });
+    }
+
+    const url = new URL(request.url);
+
+    // 画面（フロントエンド）を返すルート
+    if (request.method === "GET" && (url.pathname === "/" || url.pathname === "")) {
+      return new Response(FRONT_HTML, {
+        headers: { "content-type": "text/html; charset=utf-8" },
+      });
+    }
+
+    // AI解析用APIルート（PDFの1ページごとの画像を解析）
+    if (request.method === "POST" && url.pathname === "/api/recognize") {
+      try {
+        if (!env.OPENAI_API_KEY) {
+          return new Response(JSON.stringify({ ok: false, error: "APIキーが未設定です" }), { status: 500, headers: corsHeaders });
+        }
+
+        const body = await request.json();
+        const imageBase64 = body.image; 
+
+        if (!imageBase64) {
+          return new Response(JSON.stringify({ ok: false, error: "画像データがありません" }), { status: 400, headers: corsHeaders });
+        }
+
+        // gpt-4o を使用して解析 (JSONスキーマを強制して確実な出力を得る)
+        const openAiRes = await fetch("https://api.openai.com/v1/chat/completions", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "Authorization": `Bearer ${env.OPENAI_API_KEY}`
+          },
+          body: JSON.stringify({
+            model: "gpt-4o",
+            messages: [
+              {
+                role: "system",
+                content: "あなたは医療機関の帳票を読み取るアシスタントです。提供された画像（用紙の一部）から情報を抽出してください。\n最も重要なのは、そのページが「手術伝票」かどうかを判定することです。"
+              },
+              {
+                role: "user",
+                content: [
+                  { type: "image_url", image_url: { url: imageBase64, detail: "low" } },
+                  { type: "text", text: "この画像内に「手術伝票」という文字があるかを判定し、ある場合のみ患者ID、術式名、日付を抽出してください。" }
+                ]
+              }
+            ],
+            temperature: 0,
+            response_format: {
+              type: "json_schema",
+              json_schema: {
+                name: "separator_info",
+                strict: true,
+                schema: {
+                  type: "object",
+                  properties: {
+                    isFirstPage: { type: "boolean", description: "画像内に「手術伝票」という記載があればtrue、それ以外の帳票であればfalseにしてください" },
+                    patientId: { type: "string", description: "患者ID (例: 0000222414)。見つからない場合は空文字" },
+                    title: { type: "string", description: "施行術式などの術式名。見つからない場合は空文字" },
+                    date: { type: "string", description: "手術日 (例: 20250311)。見つからない場合は空文字" }
+                  },
+                  required: ["isFirstPage", "patientId", "title", "date"],
+                  additionalProperties: false
+                }
+              }
+            }
+          })
+        });
+
+        if (!openAiRes.ok) {
+          const errText = await openAiRes.text();
+          throw new Error("OpenAI APIエラー: " + errText);
+        }
+
+        const data = await openAiRes.json();
+        const resultText = data.choices[0].message.content;
+        const resultJson = JSON.parse(resultText);
+
+        return new Response(JSON.stringify({ ok: true, data: resultJson }), {
+          headers: { "Content-Type": "application/json", ...corsHeaders }
+        });
+
+      } catch (e) {
+        return new Response(JSON.stringify({ ok: false, error: e.message }), { status: 500, headers: corsHeaders });
+      }
+    }
+
+    return new Response("Not Found", { status: 404, headers: corsHeaders });
+  }
+};
+
+// ============================================================
+// フロント画面HTML
+// ============================================================
+const FRONT_HTML = `<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <title>PDFセパレーター自動分割ツール</title>
+    <!-- 絵文字ファビコンの設定 -->
+    <link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text x=%2250%%22 y=%2250%%22 style=%22dominant-baseline:central;text-anchor:middle;font-size:90px;%22>💔</text></svg>">
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, "Hiragino Sans", "Yu Gothic UI", Meiryo, sans-serif; margin: 20px; background-color: #f4f7f6; color: #333; }
+        .container { max-width: 800px; margin: 0 auto; background: #fff; padding: 25px; border-radius: 12px; box-shadow: 0 4px 10px rgba(0,0,0,0.1); }
+        h1 { font-size: 22px; color: #2b2f36; border-bottom: 2px solid #0056b3; padding-bottom: 10px; margin-top: 0; }
+        .controls { margin: 20px 0; padding: 18px; background: #fbfcfd; border: 1px solid #e4e7ec; border-radius: 8px; }
+        .form-group { margin-bottom: 15px; }
+        .form-group label { display: block; font-weight: bold; margin-bottom: 6px; font-size: 14px; }
+        input[type="text"], input[type="file"] { width: 100%; padding: 10px; border: 1px solid #ccc; border-radius: 6px; box-sizing: border-box; font-size: 14px; }
+        input[type="text"]:focus { outline: 2px solid rgba(0, 86, 179, 0.3); border-color: #0056b3; }
+        button { background-color: #0056b3; color: white; border: none; padding: 12px 20px; font-size: 15px; font-weight: bold; border-radius: 6px; cursor: pointer; transition: 0.2s; width: 100%; }
+        button:hover { opacity: 0.9; }
+        button:disabled { background-color: #ccc; cursor: not-allowed; }
+        #log { width: 100%; height: 350px; overflow-y: auto; background: #2b2f36; color: #4af626; padding: 12px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; box-sizing: border-box; line-height: 1.5; border-radius: 6px; margin-top: 20px; }
+    </style>
+    <!-- pdf.js と pdf-lib のCDN -->
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf-lib/1.17.1/pdf-lib.min.js"></script>
+</head>
+<body>
+
+<div class="container">
+    <h1>📄 PDFセパレーター自動分割ツール</h1>
+    
+    <div class="controls">
+        <div class="form-group">
+            <label for="prefixInput">🏷️ ファイル名の接頭語（自由入力）</label>
+            <input type="text" id="prefixInput" placeholder="例: オペ記録_肩_">
+        </div>
+
+        <div class="form-group">
+            <label for="pdfInput">📁 対象のPDF（複数ページの束）を選択</label>
+            <input type="file" id="pdfInput" accept="application/pdf">
+        </div>
+        
+        <button id="processBtn" disabled>🚀 解析と分割を開始</button>
+    </div>
+
+    <div id="log">待機中... PDFを選択してください。</div>
+</div>
+
+<script>
+    // PDF.jsのワーカー設定
+    pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
+
+    const pdfInput = document.getElementById('pdfInput');
+    const prefixInput = document.getElementById('prefixInput');
+    const processBtn = document.getElementById('processBtn');
+    const logDiv = document.getElementById('log');
+
+    let selectedFile = null;
+    let pdfBytes = null;
+
+    function log(message) {
+        const time = new Date().toLocaleTimeString();
+        logDiv.innerHTML += \`[\${time}] \${message}<br>\`;
+        logDiv.scrollTop = logDiv.scrollHeight;
+    }
+
+    pdfInput.addEventListener('change', async (e) => {
+        if (e.target.files.length > 0) {
+            selectedFile = e.target.files[0];
+            processBtn.disabled = false;
+            log(\`ファイルを選択しました: \${selectedFile.name}\`);
+            
+            const reader = new FileReader();
+            reader.onload = function(evt) {
+                pdfBytes = evt.target.result;
+            };
+            reader.readAsArrayBuffer(selectedFile);
+        }
+    });
+
+    // Workers上のAPIを呼び出す関数
+    async function recognizeImageByAPI(base64Image) {
+        const res = await fetch('/api/recognize', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ image: base64Image })
+        });
+        const json = await res.json();
+        if (!json.ok) throw new Error(json.error);
+        return json.data;
+    }
+
+    processBtn.addEventListener('click', async () => {
+        if (!pdfBytes) return;
+        processBtn.disabled = true;
+        const prefix = prefixInput.value.trim();
+        log('--- 処理を開始します ---');
+        if (prefix) log(\`接頭語 [\${prefix}] を適用します\`);
+
+        try {
+            // PDFの読み込み
+            const loadingTask = pdfjsLib.getDocument({ data: pdfBytes });
+            const pdfDocument = await loadingTask.promise;
+            const totalPages = pdfDocument.numPages;
+            log(\`PDF総ページ数: \${totalPages}ページ\`);
+
+            const pdfDocLib = await PDFLib.PDFDocument.load(pdfBytes);
+
+            let groups = []; 
+            let currentGroup = null;
+
+            // 1ページずつ解析してグループ分け
+            for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
+                log(\`----------------------------------------\`);
+                log(\`ページ \${pageNum} を解析中...\`);
+                const page = await pdfDocument.getPage(pageNum);
+                
+                const scale = 1.5;
+                const viewport = page.getViewport({ scale: scale });
+
+                const canvas = document.createElement('canvas');
+                const ctx = canvas.getContext('2d');
+                
+                // 上部40%だけを切り取る (「手術伝票」のタイトル部分を含めるため)
+                const cropWidth = viewport.width;
+                const cropHeight = viewport.height * 0.4;
+                canvas.width = cropWidth;
+                canvas.height = cropHeight;
+
+                await page.render({
+                    canvasContext: ctx,
+                    viewport: viewport,
+                    transform: [scale, 0, 0, scale, 0, 0] 
+                }).promise;
+
+                const imageData = canvas.toDataURL('image/jpeg', 0.8);
+
+                // AIへ送信
+                log('☁️ AI(API)へ画像を送信中...');
+                const aiResult = await recognizeImageByAPI(imageData);
+
+                log(\`🔍 認識結果: 手術伝票=\${aiResult.isFirstPage ? 'はい' : 'いいえ'}, ID=\${aiResult.patientId || 'なし'}\`);
+
+                // 「手術伝票」という文字が見つかった場合 ＝ 新しいセットの始まり
+                if (aiResult.isFirstPage) {
+                    log(\`✨ 新しい手術伝票を検知: ページ \${pageNum}\`);
+
+                    // すでに作成中のグループがあれば、リストに保存
+                    if (currentGroup && currentGroup.pages.length > 0) {
+                        groups.push(currentGroup);
+                    }
+
+                    // 新しいグループを作成
+                    currentGroup = {
+                        id: aiResult.patientId || "不明ID",
+                        title: aiResult.title || "記録用紙",
+                        date: aiResult.date || "日付不明",
+                        pages: [pageNum - 1] // pdf-libのページインデックスは0始まり
+                    };
+                } else {
+                    // 「手術伝票」ではない場合 ＝ 今のセットの続き（次のIDの前まで）
+                    if (currentGroup) {
+                        currentGroup.pages.push(pageNum - 1);
+                        log(\`📄 今のセットにページを追加しました。\`);
+                    } else {
+                        // 最初から「手術伝票」がないページが出た場合のフェイルセーフ
+                        currentGroup = {
+                            id: "不明ID",
+                            title: "記録用紙",
+                            date: "日付不明",
+                            pages: [pageNum - 1]
+                        };
+                        log(\`⚠ 先頭ページが「手術伝票」ではありません。不明グループとして開始します。\`);
+                    }
+                }
+            }
+
+            // 最後のグループを保存
+            if (currentGroup && currentGroup.pages.length > 0) {
+                groups.push(currentGroup);
+            }
+
+            log('----------------------------------------');
+            log('解析完了。ファイルの分割・作成を開始します。');
+
+            // グループごとにPDFを生成・ダウンロード
+            for (let i = 0; i < groups.length; i++) {
+                const group = groups[i];
+                log(\`ファイル作成中... (\${group.id} : 計\${group.pages.length}ページ)\`);
+
+                const newPdf = await PDFLib.PDFDocument.create();
+                const copiedPages = await newPdf.copyPages(pdfDocLib, group.pages);
+                copiedPages.forEach((page) => newPdf.addPage(page));
+
+                const newPdfBytes = await newPdf.save();
+
+                // ファイル名の組み立て (接頭語 + 患者ID_術式名_日付.pdf)
+                const safeTitle = group.title.replace(/[\\\\/:*?"<>|]/g, "_");
+                let fileName = \`\${group.id}_\${safeTitle}_\${group.date}.pdf\`;
+                if (prefix) {
+                    fileName = \`\${prefix}\${fileName}\`;
+                }
+
+                // ダウンロード処理
+                const blob = new Blob([newPdfBytes], { type: 'application/pdf' });
+                const link = document.createElement('a');
+                link.href = URL.createObjectURL(blob);
+                link.download = fileName;
+                link.click();
+
+                log(\`✅ 出力完了: \${fileName}\`);
+                
+                // 連続ダウンロードがブラウザにブロックされないよう待機
+                await new Promise(resolve => setTimeout(resolve, 600));
+            }
+
+            log('🎉 すべての処理が完了しました！');
+
+        } catch (error) {
+            log(\`❌ エラーが発生しました: \${error.message}\`);
+            console.error(error);
+        } finally {
+            processBtn.disabled = false;
+        }
+    });
+</script>
+</body>
+</html>`;
