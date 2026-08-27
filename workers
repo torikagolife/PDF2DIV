@@ -11,6 +11,13 @@ export default {
       return new Response(null, { headers: corsHeaders });
     }
 
+    // ---------- IP制限（院内からの接続のみ許可） ----------
+    // 環境変数 ALLOW_IPS に許可するグローバルIPを設定する。
+    // 未設定なら制限しない（設定漏れで自分が入れなくなるのを防ぐため）。
+    if (!ipAllowed(request, env)) {
+      return denyResponse();
+    }
+
     const url = new URL(request.url);
 
     // 画面（フロントエンド）を返すルート
@@ -52,7 +59,7 @@ export default {
                 role: "user",
                 content: [
                   { type: "image_url", image_url: { url: imageBase64, detail: "low" } },
-                  { type: "text", text: "この画像内に「手術伝票」という文字があるかを判定し、ある場合のみ患者ID、術式名、日付を抽出してください。" }
+                  { type: "text", text: "この画像内に「手術伝票」という文字があるかを判定し、ある場合のみ患者ID、患者名、術式名、日付を抽出してください。" }
                 ]
               }
             ],
@@ -67,10 +74,11 @@ export default {
                   properties: {
                     isFirstPage: { type: "boolean", description: "画像内に「手術伝票」という記載があればtrue、それ以外の帳票であればfalseにしてください" },
                     patientId: { type: "string", description: "患者ID (例: 0000222414)。見つからない場合は空文字" },
+                    patientName: { type: "string", description: "「患者名」または「氏名」の欄に書かれている患者の氏名。塗りつぶされている・空欄・読み取れない場合は空文字。推測で氏名を作らないこと" },
                     title: { type: "string", description: "施行術式などの術式名。見つからない場合は空文字" },
                     date: { type: "string", description: "手術日 (例: 20250311)。見つからない場合は空文字" }
                   },
-                  required: ["isFirstPage", "patientId", "title", "date"],
+                  required: ["isFirstPage", "patientId", "patientName", "title", "date"],
                   additionalProperties: false
                 }
               }
@@ -101,6 +109,155 @@ export default {
 };
 
 // ============================================================
+// IP制限
+//   ALLOW_IPS に許可IPを書く。カンマ・空白・改行のどれで区切ってもよい。
+//   単独のIP（192.0.2.10）と、範囲指定のCIDR（192.0.2.0/24）に対応。
+//   IPv4・IPv6どちらも書ける。
+//   未設定のときは制限しない（ロックアウト防止）。
+// ============================================================
+function clientIp(request) {
+  return (request.headers.get("CF-Connecting-IP") || "").trim();
+}
+
+function ipAllowed(request, env) {
+  const raw = String((env && env.ALLOW_IPS) || "").trim();
+  if (!raw) return true;                       // 未設定なら素通り
+
+  const ip = clientIp(request);
+  if (!ip) return false;                       // 取得できない場合は通さない
+
+  const list = raw.split(/[\s,]+/).filter(Boolean);
+  for (const entry of list) {
+    if (matchIp(ip, entry)) return true;
+  }
+  return false;
+}
+
+function matchIp(ip, entry) {
+  const slash = entry.indexOf("/");
+  if (slash < 0) {
+    // 単独IP。表記ゆれ（IPv6の大文字小文字や省略形）を吸収して比べる
+    return normIp(ip) === normIp(entry);
+  }
+  const net = entry.slice(0, slash);
+  const bits = parseInt(entry.slice(slash + 1), 10);
+  if (isNaN(bits)) return false;
+
+  const a = ipToBytes(ip);
+  const b = ipToBytes(net);
+  if (!a || !b || a.length !== b.length) return false;   // v4とv6は比べない
+  if (bits < 0 || bits > a.length * 8) return false;
+
+  let full = bits >> 3;                                   // 丸ごと一致するバイト数
+  for (let i = 0; i < full; i++) if (a[i] !== b[i]) return false;
+  const rest = bits & 7;
+  if (rest) {
+    const mask = 0xff << (8 - rest) & 0xff;
+    if ((a[full] & mask) !== (b[full] & mask)) return false;
+  }
+  return true;
+}
+
+function normIp(s) {
+  const b = ipToBytes(String(s || "").trim());
+  if (!b) return String(s || "").trim().toLowerCase();
+  return b.join(".");
+}
+
+// IPv4は4バイト、IPv6は16バイトの配列にする。読めなければ null
+function ipToBytes(str) {
+  const s = String(str || "").trim();
+  if (!s) return null;
+
+  if (s.indexOf(":") < 0) {
+    const p = s.split(".");
+    if (p.length !== 4) return null;
+    const out = [];
+    for (const x of p) {
+      if (!/^\d{1,3}$/.test(x)) return null;
+      const n = parseInt(x, 10);
+      if (n > 255) return null;
+      out.push(n);
+    }
+    return out;
+  }
+
+  // IPv6（末尾がIPv4表記のものも受ける）
+  let t = s.toLowerCase();
+  let tail = [];
+  const lastColon = t.lastIndexOf(":");
+  const afterLast = t.slice(lastColon + 1);
+  if (afterLast.indexOf(".") >= 0) {
+    const v4 = ipToBytes(afterLast);
+    if (!v4) return null;
+    tail = v4;
+    t = t.slice(0, lastColon + 1) + "0:0";
+  }
+
+  const dbl = t.indexOf("::");
+  let head = [], rear = [];
+  const toWords = (part) => {
+    if (!part) return [];
+    const out = [];
+    for (const h of part.split(":")) {
+      if (!/^[0-9a-f]{1,4}$/.test(h)) return null;
+      const n = parseInt(h, 16);
+      out.push((n >> 8) & 0xff, n & 0xff);
+    }
+    return out;
+  };
+  if (dbl >= 0) {
+    head = toWords(t.slice(0, dbl));
+    rear = toWords(t.slice(dbl + 2));
+    if (head === null || rear === null) return null;
+  } else {
+    head = toWords(t);
+    if (head === null) return null;
+  }
+
+  const used = head.length + rear.length + tail.length;
+  if (used > 16) return null;
+  const zeros = new Array(16 - used).fill(0);
+  const bytes = head.concat(zeros, rear, tail);
+  return bytes.length === 16 ? bytes : null;
+}
+
+// 院外からの接続。詳細は出さない（接続元IPや案内文は表示しない）
+function denyResponse() {
+  return new Response(DENY_HTML, {
+    status: 403,
+    headers: {
+      "content-type": "text/html; charset=utf-8",
+      "cache-control": "no-store",
+    },
+  });
+}
+
+const DENY_HTML = `<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>接続が許可されていません</title>
+<style>
+  body{margin:0;min-height:100vh;display:flex;align-items:center;justify-content:center;
+    background:#f5f6f8;color:#2b2f36;
+    font-family:-apple-system,BlinkMacSystemFont,"Hiragino Sans","Yu Gothic UI",Meiryo,sans-serif}
+  .card{background:#fff;border:1px solid #e4e7ec;border-radius:14px;padding:34px 30px;
+    max-width:380px;width:calc(100% - 32px);text-align:center;box-shadow:0 6px 24px rgba(0,0,0,.06)}
+  .mark{font-size:34px;line-height:1}
+  h1{font-size:17px;margin:14px 0 0;font-weight:700}
+</style>
+</head>
+<body>
+  <div class="card">
+    <div class="mark">🔒</div>
+    <h1>接続が許可されていません</h1>
+  </div>
+</body>
+</html>`;
+
+// ============================================================
 // フロント画面HTML
 // ============================================================
 const FRONT_HTML = `<!DOCTYPE html>
@@ -122,6 +279,9 @@ const FRONT_HTML = `<!DOCTYPE html>
         button { background-color: #0056b3; color: white; border: none; padding: 12px 20px; font-size: 15px; font-weight: bold; border-radius: 6px; cursor: pointer; transition: 0.2s; width: 100%; }
         button:hover { opacity: 0.9; }
         button:disabled { background-color: #ccc; cursor: not-allowed; }
+        .checkline { display: flex; align-items: center; gap: 8px; font-weight: bold; font-size: 14px; cursor: pointer; }
+        .checkline input { width: 17px; height: 17px; }
+        .note { font-size: 12px; color: #6c8286; margin-top: 5px; line-height: 1.7; }
         #log { width: 100%; height: 350px; overflow-y: auto; background: #2b2f36; color: #4af626; padding: 12px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; box-sizing: border-box; line-height: 1.5; border-radius: 6px; margin-top: 20px; }
     </style>
     <!-- pdf.js と pdf-lib のCDN -->
@@ -143,6 +303,14 @@ const FRONT_HTML = `<!DOCTYPE html>
             <label for="pdfInput">📁 対象のPDF（複数ページの束）を選択</label>
             <input type="file" id="pdfInput" accept="application/pdf">
         </div>
+
+        <div class="form-group">
+            <label class="checkline">
+              <input type="checkbox" id="useNameInput" checked>
+              ファイル名に患者名を入れる
+            </label>
+            <div class="note">患者番号_<b>患者名</b>_術式_日付.pdf の形式になります。外すと従来どおり患者名なしで出力します。</div>
+        </div>
         
         <button id="processBtn" disabled>🚀 解析と分割を開始</button>
     </div>
@@ -156,6 +324,7 @@ const FRONT_HTML = `<!DOCTYPE html>
 
     const pdfInput = document.getElementById('pdfInput');
     const prefixInput = document.getElementById('prefixInput');
+    const useNameInput = document.getElementById('useNameInput');
     const processBtn = document.getElementById('processBtn');
     const logDiv = document.getElementById('log');
 
@@ -181,6 +350,14 @@ const FRONT_HTML = `<!DOCTYPE html>
             reader.readAsArrayBuffer(selectedFile);
         }
     });
+
+    // ファイル名に使えない文字を落とし、前後と間の空白を整える
+    function cleanForName(s) {
+        return String(s || "")
+            .replace(/[\\\\/:*?"<>|]/g, "_")   // 使えない記号
+            .replace(/[\\s\\u3000]+/g, "")       // 半角・全角の空白は詰める
+            .trim();
+    }
 
     // Workers上のAPIを呼び出す関数
     async function recognizeImageByAPI(base64Image) {
@@ -243,7 +420,7 @@ const FRONT_HTML = `<!DOCTYPE html>
                 log('☁️ AI(API)へ画像を送信中...');
                 const aiResult = await recognizeImageByAPI(imageData);
 
-                log(\`🔍 認識結果: 手術伝票=\${aiResult.isFirstPage ? 'はい' : 'いいえ'}, ID=\${aiResult.patientId || 'なし'}\`);
+                log(\`🔍 認識結果: 手術伝票=\${aiResult.isFirstPage ? 'はい' : 'いいえ'}, ID=\${aiResult.patientId || 'なし'}, 氏名=\${aiResult.patientName || 'なし'}\`);
 
                 // 「手術伝票」という文字が見つかった場合 ＝ 新しいセットの始まり
                 if (aiResult.isFirstPage) {
@@ -257,6 +434,7 @@ const FRONT_HTML = `<!DOCTYPE html>
                     // 新しいグループを作成
                     currentGroup = {
                         id: aiResult.patientId || "不明ID",
+                        name: aiResult.patientName || "",
                         title: aiResult.title || "記録用紙",
                         date: aiResult.date || "日付不明",
                         pages: [pageNum - 1] // pdf-libのページインデックスは0始まり
@@ -270,6 +448,7 @@ const FRONT_HTML = `<!DOCTYPE html>
                         // 最初から「手術伝票」がないページが出た場合のフェイルセーフ
                         currentGroup = {
                             id: "不明ID",
+                            name: "",
                             title: "記録用紙",
                             date: "日付不明",
                             pages: [pageNum - 1]
@@ -298,9 +477,16 @@ const FRONT_HTML = `<!DOCTYPE html>
 
                 const newPdfBytes = await newPdf.save();
 
-                // ファイル名の組み立て (接頭語 + 患者ID_術式名_日付.pdf)
-                const safeTitle = group.title.replace(/[\\\\/:*?"<>|]/g, "_");
-                let fileName = \`\${group.id}_\${safeTitle}_\${group.date}.pdf\`;
+                // ファイル名の組み立て (接頭語 + 患者ID_患者名_術式名_日付.pdf)
+                //   患者名はチェックが入っている時だけ。読み取れなかった場合は入れない。
+                const safeTitle = cleanForName(group.title);
+                const safeName = useNameInput.checked ? cleanForName(group.name) : "";
+
+                const parts = [group.id];
+                if (safeName) parts.push(safeName);
+                parts.push(safeTitle, group.date);
+
+                let fileName = parts.join("_") + ".pdf";
                 if (prefix) {
                     fileName = \`\${prefix}\${fileName}\`;
                 }
