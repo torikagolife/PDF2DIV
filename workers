@@ -59,7 +59,7 @@ export default {
                 role: "user",
                 content: [
                   { type: "image_url", image_url: { url: imageBase64, detail: "low" } },
-                  { type: "text", text: "この画像内に「手術伝票」という文字があるかを判定し、ある場合のみ患者ID、患者名、術式名、日付を抽出してください。" }
+                  { type: "text", text: "この画像内に「手術伝票」という文字があるかを判定し、ある場合のみ手術日・患者番号・患者氏名・術式名を抽出してください。" }
                 ]
               }
             ],
@@ -73,10 +73,10 @@ export default {
                   type: "object",
                   properties: {
                     isFirstPage: { type: "boolean", description: "画像内に「手術伝票」という記載があればtrue、それ以外の帳票であればfalseにしてください" },
-                    patientId: { type: "string", description: "患者ID (例: 0000222414)。見つからない場合は空文字" },
-                    patientName: { type: "string", description: "「患者名」または「氏名」の欄に書かれている患者の氏名。塗りつぶされている・空欄・読み取れない場合は空文字。推測で氏名を作らないこと" },
-                    title: { type: "string", description: "施行術式などの術式名。見つからない場合は空文字" },
-                    date: { type: "string", description: "手術日 (例: 20250311)。見つからない場合は空文字" }
+                    patientId: { type: "string", description: "「患者番号」または「患者ID」の欄の数字（例: 520389, 0000222414）。先頭の0も省略せずそのまま。見つからない場合は空文字" },
+                    patientName: { type: "string", description: "「氏名（カナ）」「患者名」「氏名」のいずれかの欄に書かれている患者の氏名。カタカナのこともある。塗りつぶされている・空欄・読み取れない場合は空文字。推測で氏名を作らないこと" },
+                    title: { type: "string", description: "「施行術式」または「術後術式」の欄の術式名。見つからない場合は空文字" },
+                    date: { type: "string", description: "「手術日」の欄の日付。用紙の右上、患者名の右隣にあることが多い。2026/07/16 のような形式なので 20260716 のように数字8桁で返す。「印刷日時」や「生年月日」と間違えないこと。見つからない場合は空文字" }
                   },
                   required: ["isFirstPage", "patientId", "patientName", "title", "date"],
                   additionalProperties: false
@@ -296,7 +296,7 @@ const FRONT_HTML = `<!DOCTYPE html>
     <div class="controls">
         <div class="form-group">
             <label for="prefixInput">🏷️ ファイル名の接頭語（自由入力）</label>
-            <input type="text" id="prefixInput" placeholder="例: オペ記録_肩_">
+            <input type="text" id="prefixInput" placeholder="例: 202604人工関節">
         </div>
 
         <div class="form-group">
@@ -309,7 +309,7 @@ const FRONT_HTML = `<!DOCTYPE html>
               <input type="checkbox" id="useNameInput" checked>
               ファイル名に患者名を入れる
             </label>
-            <div class="note">患者番号_<b>患者名</b>_術式_日付.pdf の形式になります。外すと従来どおり患者名なしで出力します。</div>
+            <div class="note">接頭語_手術日_患者番号_<b>患者名</b>.pdf の形式になります。外すと患者名なしで出力します。</div>
         </div>
         
         <button id="processBtn" disabled>🚀 解析と分割を開始</button>
@@ -350,6 +350,29 @@ const FRONT_HTML = `<!DOCTYPE html>
             reader.readAsArrayBuffer(selectedFile);
         }
     });
+
+    // 患者IDを7桁にそろえる
+    //   院内の手術伝票は 0000513572 のように0埋めされた10桁、
+    //   手術伝票プラスは 513572 のように0埋めなしで印字されるため、
+    //   どちらから読んでも同じ 0513572 になるように下7桁で統一する。
+    function patientId7(s) {
+        const d = String(s || "").replace(/[^0-9]/g, "");
+        if (!d) return "";
+        if (d.length > 7) return d.slice(-7);          // 先頭の0埋めを落として下7桁
+        return ("0000000" + d).slice(-7);              // 7桁に満たなければ0で埋める
+    }
+
+    // 「2026/07/16」「2026.7.6」などを 20260716 の8桁にそろえる
+    function ymd8(s) {
+        const t = String(s || "").trim();
+        if (!t) return "";
+        const parts = t.split(/[^0-9]+/).filter(x => x.length);
+        if (parts.length >= 3 && parts[0].length === 4) {
+            return parts[0] + ("0" + parts[1]).slice(-2) + ("0" + parts[2]).slice(-2);
+        }
+        const digits = t.replace(/[^0-9]/g, "");
+        return digits.length >= 8 ? digits.slice(0, 8) : digits;
+    }
 
     // ファイル名に使えない文字を落とし、前後と間の空白を整える
     function cleanForName(s) {
@@ -403,6 +426,9 @@ const FRONT_HTML = `<!DOCTYPE html>
                 const ctx = canvas.getContext('2d');
                 
                 // 上部40%だけを切り取る (「手術伝票」のタイトル部分を含めるため)
+                //   viewport には既に scale が掛かっているので、ここで transform を
+                //   重ねると倍率が二重（1.5×1.5=2.25倍）になり、用紙の左上しか写らない。
+                //   右端にある「手術日」が画角から外れて読めなくなるため transform は渡さない。
                 const cropWidth = viewport.width;
                 const cropHeight = viewport.height * 0.4;
                 canvas.width = cropWidth;
@@ -410,8 +436,7 @@ const FRONT_HTML = `<!DOCTYPE html>
 
                 await page.render({
                     canvasContext: ctx,
-                    viewport: viewport,
-                    transform: [scale, 0, 0, scale, 0, 0] 
+                    viewport: viewport
                 }).promise;
 
                 const imageData = canvas.toDataURL('image/jpeg', 0.8);
@@ -420,7 +445,7 @@ const FRONT_HTML = `<!DOCTYPE html>
                 log('☁️ AI(API)へ画像を送信中...');
                 const aiResult = await recognizeImageByAPI(imageData);
 
-                log(\`🔍 認識結果: 手術伝票=\${aiResult.isFirstPage ? 'はい' : 'いいえ'}, ID=\${aiResult.patientId || 'なし'}, 氏名=\${aiResult.patientName || 'なし'}\`);
+                log(\`🔍 認識結果: 手術伝票=\${aiResult.isFirstPage ? 'はい' : 'いいえ'}, 手術日=\${aiResult.date || 'なし'}, ID=\${aiResult.patientId || 'なし'}, 氏名=\${aiResult.patientName || 'なし'}\`);
 
                 // 「手術伝票」という文字が見つかった場合 ＝ 新しいセットの始まり
                 if (aiResult.isFirstPage) {
@@ -469,7 +494,7 @@ const FRONT_HTML = `<!DOCTYPE html>
             // グループごとにPDFを生成・ダウンロード
             for (let i = 0; i < groups.length; i++) {
                 const group = groups[i];
-                log(\`ファイル作成中... (\${group.id} : 計\${group.pages.length}ページ)\`);
+                log(\`ファイル作成中... (\${patientId7(group.id) || group.id} : 計\${group.pages.length}ページ)\`);
 
                 const newPdf = await PDFLib.PDFDocument.create();
                 const copiedPages = await newPdf.copyPages(pdfDocLib, group.pages);
@@ -477,19 +502,17 @@ const FRONT_HTML = `<!DOCTYPE html>
 
                 const newPdfBytes = await newPdf.save();
 
-                // ファイル名の組み立て (接頭語 + 患者ID_患者名_術式名_日付.pdf)
-                //   患者名はチェックが入っている時だけ。読み取れなかった場合は入れない。
-                const safeTitle = cleanForName(group.title);
+                // ファイル名の組み立て（接頭語_手術日_患者ID_患者名.pdf）
+                //   患者名はチェックが入っている時だけ。読み取れなかった項目は飛ばす。
                 const safeName = useNameInput.checked ? cleanForName(group.name) : "";
 
-                const parts = [group.id];
-                if (safeName) parts.push(safeName);
-                parts.push(safeTitle, group.date);
+                const parts = [];
+                if (prefix)     parts.push(cleanForName(prefix));
+                if (group.date) parts.push(ymd8(group.date));
+                if (group.id)   parts.push(patientId7(group.id) || cleanForName(group.id));
+                if (safeName)   parts.push(safeName);
 
-                let fileName = parts.join("_") + ".pdf";
-                if (prefix) {
-                    fileName = \`\${prefix}\${fileName}\`;
-                }
+                let fileName = (parts.filter(Boolean).join("_") || "記録用紙") + ".pdf";
 
                 // ダウンロード処理
                 const blob = new Blob([newPdfBytes], { type: 'application/pdf' });
