@@ -53,12 +53,12 @@ export default {
             messages: [
               {
                 role: "system",
-                content: "あなたは医療機関の帳票を読み取るアシスタントです。提供された画像（用紙の一部）から情報を抽出してください。\n最も重要なのは、そのページが「手術伝票」かどうかを判定することです。"
+                content: "あなたは医療機関の帳票を読み取る凄腕のアシスタントです。提供された画像（用紙の一部）から情報を抽出してください。\n最も重要なのは、そのページが「手術伝票」かどうかを判定することです。"
               },
               {
                 role: "user",
                 content: [
-                  { type: "image_url", image_url: { url: imageBase64, detail: "low" } },
+                  { type: "image_url", image_url: { url: imageBase64, detail: "high" } },
                   { type: "text", text: "この画像内に「手術伝票」という文字があるかを判定し、ある場合のみ手術日・患者番号・患者氏名・術式名を抽出してください。" }
                 ]
               }
@@ -74,7 +74,7 @@ export default {
                   properties: {
                     isFirstPage: { type: "boolean", description: "画像内に「手術伝票」という記載があればtrue、それ以外の帳票であればfalseにしてください" },
                     patientId: { type: "string", description: "「患者番号」または「患者ID」の欄の数字（例: 520389, 0000222414）。先頭の0も省略せずそのまま。見つからない場合は空文字" },
-                    patientName: { type: "string", description: "「氏名（カナ）」「患者名」「氏名」のいずれかの欄に書かれている患者の氏名。カタカナのこともある。塗りつぶされている・空欄・読み取れない場合は空文字。推測で氏名を作らないこと" },
+                    patientName: { type: "string", description: "「氏名（カナ）」欄に書かれている患者のカナ氏名。塗りつぶされている・空欄・読み取れない場合は空文字。推測で氏名を作らないこと" },
                     title: { type: "string", description: "「施行術式」または「術後術式」の欄の術式名。見つからない場合は空文字" },
                     date: { type: "string", description: "「手術日」の欄の日付。用紙の右上、患者名の右隣にあることが多い。2026/07/16 のような形式なので 20260716 のように数字8桁で返す。「印刷日時」や「生年月日」と間違えないこと。見つからない場合は空文字" }
                   },
@@ -351,15 +351,15 @@ const FRONT_HTML = `<!DOCTYPE html>
         }
     });
 
-    // 患者IDを7桁にそろえる
+    // 患者IDを6桁にそろえる
     //   院内の手術伝票は 0000513572 のように0埋めされた10桁、
     //   手術伝票プラスは 513572 のように0埋めなしで印字されるため、
-    //   どちらから読んでも同じ 0513572 になるように下7桁で統一する。
-    function patientId7(s) {
+    //   どちらから読んでも同じ 513572 になるように下6桁で統一する。
+    function patientId6(s) {
         const d = String(s || "").replace(/[^0-9]/g, "");
         if (!d) return "";
-        if (d.length > 7) return d.slice(-7);          // 先頭の0埋めを落として下7桁
-        return ("0000000" + d).slice(-7);              // 7桁に満たなければ0で埋める
+        if (d.length > 6) return d.slice(-6);          // 先頭の0埋めを落として下6桁
+        return ("000000" + d).slice(-6);               // 6桁に満たなければ0で埋める
     }
 
     // 「2026/07/16」「2026.7.6」などを 20260716 の8桁にそろえる
@@ -494,7 +494,7 @@ const FRONT_HTML = `<!DOCTYPE html>
             // グループごとにPDFを生成・ダウンロード
             for (let i = 0; i < groups.length; i++) {
                 const group = groups[i];
-                log(\`ファイル作成中... (\${patientId7(group.id) || group.id} : 計\${group.pages.length}ページ)\`);
+                log(\`ファイル作成中... (\${patientId6(group.id) || group.id} : 計\${group.pages.length}ページ)\`);
 
                 const newPdf = await PDFLib.PDFDocument.create();
                 const copiedPages = await newPdf.copyPages(pdfDocLib, group.pages);
@@ -509,7 +509,7 @@ const FRONT_HTML = `<!DOCTYPE html>
                 const parts = [];
                 if (prefix)     parts.push(cleanForName(prefix));
                 if (group.date) parts.push(ymd8(group.date));
-                if (group.id)   parts.push(patientId7(group.id) || cleanForName(group.id));
+                if (group.id)   parts.push(patientId6(group.id) || cleanForName(group.id));
                 if (safeName)   parts.push(safeName);
 
                 let fileName = (parts.filter(Boolean).join("_") || "記録用紙") + ".pdf";
