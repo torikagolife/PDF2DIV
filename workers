@@ -1,3 +1,36 @@
+// ============================================================
+// PDFセパレーター自動分割ツール（Cloudflare Worker）
+// ------------------------------------------------------------
+//  スキャンした手術伝票の束PDFを、患者ごとのPDFに切り分ける。
+//  「手術伝票」と書かれたページを区切りとして検出する部分だけAIに任せ、
+//  分割・ファイル名付け・保存はすべてブラウザ内で行う。
+//
+//  [v3 の修正点]
+//   ・API呼び出しに再試行（指数バックオフ）を入れた
+//       → 途中で1回429や通信エラーが出ても全損しなくなった。
+//         これまではページ数が多い（＝元ファイルが大きい）ほど
+//         「どこかで1回失敗して出力0件」になる確率が上がっていた。
+//   ・最後まで読めなかったページがあっても処理を止めず、
+//     どのページが読めなかったかを最後にまとめて報告する
+//   ・FileReaderの完了を待ってからボタンを有効化（大きいファイルの空振り防止）
+//   ・ログをinnerHTMLの連結からappendChildに変更（数百行でも重くならない）
+//     併せてAIの返り値をHTMLとして解釈しないようにした
+//   ・Blob URLとキャンバスを都度解放（出力PDFがメモリに残り続けるのを防ぐ）
+//   ・AIへの問い合わせにタイムアウトを設定
+//   ・Worker側が429を500に書き換えず、本来のステータスで返すようにした
+//   ・解析結果を保持し、「再分割のみ」でAIに問い直さず作り直せるようにした
+// ============================================================
+
+// ---------- AI問い合わせの設定（ここだけ見れば変えられる） ----------
+const OPENAI_MODEL      = "gpt-4o";
+
+// ★画像の精度。"low"（1ページ約0.2円）か "high"（約0.4円）。
+//   以前「highにした」と伺っていたので high にしてあります。
+//   low に戻す場合はここ1行だけ書き換えてください。
+const IMAGE_DETAIL      = "high";
+
+const OPENAI_TIMEOUT_MS = 55000;     // OpenAIからの応答を待つ上限
+
 export default {
   async fetch(request, env) {
     // CORS設定（ブラウザからの通信を許可）
@@ -29,84 +62,136 @@ export default {
 
     // AI解析用APIルート（PDFの1ページごとの画像を解析）
     if (request.method === "POST" && url.pathname === "/api/recognize") {
-      try {
-        if (!env.OPENAI_API_KEY) {
-          return new Response(JSON.stringify({ ok: false, error: "APIキーが未設定です" }), { status: 500, headers: corsHeaders });
-        }
-
-        const body = await request.json();
-        const imageBase64 = body.image; 
-
-        if (!imageBase64) {
-          return new Response(JSON.stringify({ ok: false, error: "画像データがありません" }), { status: 400, headers: corsHeaders });
-        }
-
-        // gpt-4o を使用して解析 (JSONスキーマを強制して確実な出力を得る)
-        const openAiRes = await fetch("https://api.openai.com/v1/chat/completions", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            "Authorization": `Bearer ${env.OPENAI_API_KEY}`
-          },
-          body: JSON.stringify({
-            model: "gpt-4o",
-            messages: [
-              {
-                role: "system",
-                content: "あなたは医療機関の帳票を読み取る凄腕のアシスタントです。提供された画像（用紙の一部）から情報を抽出してください。\n最も重要なのは、そのページが「手術伝票」かどうかを判定することです。"
-              },
-              {
-                role: "user",
-                content: [
-                  { type: "image_url", image_url: { url: imageBase64, detail: "high" } },
-                  { type: "text", text: "この画像内に「手術伝票」という文字があるかを判定し、ある場合のみ手術日・患者番号・患者氏名・術式名を抽出してください。" }
-                ]
-              }
-            ],
-            temperature: 0,
-            response_format: {
-              type: "json_schema",
-              json_schema: {
-                name: "separator_info",
-                strict: true,
-                schema: {
-                  type: "object",
-                  properties: {
-                    isFirstPage: { type: "boolean", description: "画像内に「手術伝票」という記載があればtrue、それ以外の帳票であればfalseにしてください" },
-                    patientId: { type: "string", description: "「患者番号」または「患者ID」の欄の数字（例: 513572, 0000222414）。0埋めされていてもそのまま全桁読み取る。見つからない場合は空文字" },
-                    patientName: { type: "string", description: "「氏名（カナ）」欄に書かれている患者のカナ氏名。全角カタカナで書かれている（例: テストカンジャ、ヤマダ タロウ）。姓と名の間の空白は残す。濁点や半濁点は文字と一体で読む（ダ・パなど。タ゛のように分けない）。塗りつぶされている・空欄・読み取れない場合は空文字。推測で氏名を作らないこと" },
-                    title: { type: "string", description: "「施行術式」または「術後術式」の欄の術式名。見つからない場合は空文字" },
-                    date: { type: "string", description: "「手術日」の欄の日付。用紙の右上、患者名の右隣にあることが多い。2026/07/16 のような形式なので 20260716 のように数字8桁で返す。「印刷日時」や「生年月日」と間違えないこと。見つからない場合は空文字" }
-                  },
-                  required: ["isFirstPage", "patientId", "patientName", "title", "date"],
-                  additionalProperties: false
-                }
-              }
-            }
-          })
-        });
-
-        if (!openAiRes.ok) {
-          const errText = await openAiRes.text();
-          throw new Error("OpenAI APIエラー: " + errText);
-        }
-
-        const data = await openAiRes.json();
-        const resultText = data.choices[0].message.content;
-        const resultJson = JSON.parse(resultText);
-
-        return new Response(JSON.stringify({ ok: true, data: resultJson }), {
-          headers: { "Content-Type": "application/json", ...corsHeaders }
-        });
-
-      } catch (e) {
-        return new Response(JSON.stringify({ ok: false, error: e.message }), { status: 500, headers: corsHeaders });
-      }
+      return await recognize(request, env, corsHeaders);
     }
 
     return new Response("Not Found", { status: 404, headers: corsHeaders });
   }
 };
+
+// ============================================================
+// 1ページ分の画像をAIに判定させる
+//   ステータスは書き換えずにそのまま返す。
+//   429（レート制限）や5xx（一時的な障害）をブラウザ側が見分けて
+//   待ってから再試行できるようにするため。
+// ============================================================
+async function recognize(request, env, corsHeaders) {
+  const jsonHeaders = { "Content-Type": "application/json", ...corsHeaders };
+  const fail = (status, error, retryable, extra) =>
+    new Response(JSON.stringify({ ok: false, error, status, retryable: !!retryable }), {
+      status,
+      headers: Object.assign({}, jsonHeaders, extra || {})
+    });
+
+  try {
+    if (!env.OPENAI_API_KEY) {
+      return fail(500, "APIキーが未設定です", false);
+    }
+
+    let body;
+    try {
+      body = await request.json();
+    } catch (e) {
+      return fail(400, "リクエストを読めませんでした", false);
+    }
+
+    const imageBase64 = body && body.image;
+    if (!imageBase64 || typeof imageBase64 !== "string") {
+      return fail(400, "画像データがありません", false);
+    }
+    if (imageBase64.indexOf("data:image/") !== 0) {
+      return fail(400, "画像の形式が想定と違います", false);
+    }
+
+    // OpenAIが応答しないまま止まらないよう上限を設ける
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), OPENAI_TIMEOUT_MS);
+
+    let openAiRes;
+    try {
+      openAiRes = await fetch("https://api.openai.com/v1/chat/completions", {
+        method: "POST",
+        signal: ac.signal,
+        headers: {
+          "Content-Type": "application/json",
+          "Authorization": `Bearer ${env.OPENAI_API_KEY}`
+        },
+        body: JSON.stringify({
+          model: OPENAI_MODEL,
+          messages: [
+            {
+              role: "system",
+              content: "あなたは医療機関の帳票を読み取る凄腕のアシスタントです。提供された画像（用紙の一部）から情報を抽出してください。\n最も重要なのは、そのページが「手術伝票」かどうかを判定することです。"
+            },
+            {
+              role: "user",
+              content: [
+                { type: "image_url", image_url: { url: imageBase64, detail: IMAGE_DETAIL } },
+                { type: "text", text: "この画像内に「手術伝票」という文字があるかを判定し、ある場合のみ手術日・患者番号・患者氏名・術式名を抽出してください。" }
+              ]
+            }
+          ],
+          temperature: 0,
+          response_format: {
+            type: "json_schema",
+            json_schema: {
+              name: "separator_info",
+              strict: true,
+              schema: {
+                type: "object",
+                properties: {
+                  isFirstPage: { type: "boolean", description: "画像内に「手術伝票」という記載があればtrue、それ以外の帳票であればfalseにしてください" },
+                  patientId: { type: "string", description: "「患者番号」または「患者ID」の欄の数字（例: 513572, 0000222414）。0埋めされていてもそのまま全桁読み取る。見つからない場合は空文字" },
+                  patientName: { type: "string", description: "「氏名（カナ）」欄に書かれている患者のカナ氏名。全角カタカナで書かれている（例: テストカンジャ、ヤマダ タロウ）。姓と名の間の空白は残す。濁点や半濁点は文字と一体で読む（ダ・パなど。タ゛のように分けない）。塗りつぶされている・空欄・読み取れない場合は空文字。推測で氏名を作らないこと" },
+                  title: { type: "string", description: "「施行術式」または「術後術式」の欄の術式名。見つからない場合は空文字" },
+                  date: { type: "string", description: "「手術日」の欄の日付。用紙の右上、患者名の右隣にあることが多い。2026/07/16 のような形式なので 20260716 のように数字8桁で返す。「印刷日時」や「生年月日」と間違えないこと。見つからない場合は空文字" }
+                },
+                required: ["isFirstPage", "patientId", "patientName", "title", "date"],
+                additionalProperties: false
+              }
+            }
+          }
+        })
+      });
+    } catch (e) {
+      clearTimeout(timer);
+      // 中断（タイムアウト）や通信障害。どちらも時間を置けば直る可能性がある
+      const aborted = e && e.name === "AbortError";
+      return fail(504, aborted ? "OpenAIの応答がありませんでした（タイムアウト）" : "OpenAIに接続できませんでした", true);
+    }
+    clearTimeout(timer);
+
+    if (!openAiRes.ok) {
+      const errText = (await openAiRes.text().catch(() => "")).slice(0, 400);
+      const st = openAiRes.status;
+      // 429（レート制限）と5xx（一時障害）は待てば直る。それ以外は直らない
+      const retryable = st === 429 || st === 408 || st >= 500;
+      const extra = {};
+      const ra = openAiRes.headers.get("Retry-After");
+      if (ra) extra["Retry-After"] = ra;      // OpenAIの指示をそのまま渡す
+      return fail(st, "OpenAI APIエラー(" + st + "): " + errText, retryable, extra);
+    }
+
+    const data = await openAiRes.json();
+    const resultText = data && data.choices && data.choices[0] &&
+                       data.choices[0].message && data.choices[0].message.content;
+    if (!resultText) {
+      return fail(502, "AIの応答が空でした", true);
+    }
+
+    let resultJson;
+    try {
+      resultJson = JSON.parse(resultText);
+    } catch (e) {
+      return fail(502, "AIの応答を解釈できませんでした", true);
+    }
+
+    return new Response(JSON.stringify({ ok: true, data: resultJson }), { headers: jsonHeaders });
+
+  } catch (e) {
+    return fail(500, (e && e.message) ? e.message : String(e), true);
+  }
+}
 
 // ============================================================
 // IP制限
@@ -279,10 +364,19 @@ const FRONT_HTML = `<!DOCTYPE html>
         button { background-color: #0056b3; color: white; border: none; padding: 12px 20px; font-size: 15px; font-weight: bold; border-radius: 6px; cursor: pointer; transition: 0.2s; width: 100%; }
         button:hover { opacity: 0.9; }
         button:disabled { background-color: #ccc; cursor: not-allowed; }
+        button.sub { background-color: #5a6b7c; font-size: 13px; padding: 9px 14px; margin-top: 8px; }
         .checkline { display: flex; align-items: center; gap: 8px; font-weight: bold; font-size: 14px; cursor: pointer; }
         .checkline input { width: 17px; height: 17px; }
         .note { font-size: 12px; color: #6c8286; margin-top: 5px; line-height: 1.7; }
+        .bar { height: 8px; background: #e4e7ec; border-radius: 4px; overflow: hidden; margin-top: 14px; display: none; }
+        .bar > i { display: block; height: 100%; width: 0; background: #0056b3; transition: width .2s; }
+        .barlabel { font-size: 12px; color: #4a5a68; margin-top: 5px; display: none; }
         #log { width: 100%; height: 350px; overflow-y: auto; background: #2b2f36; color: #4af626; padding: 12px; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: 13px; box-sizing: border-box; line-height: 1.5; border-radius: 6px; margin-top: 20px; }
+        #log div { white-space: pre-wrap; word-break: break-all; }
+        #log div.warn { color: #ffd166; }
+        #log div.bad  { color: #ff8a80; }
+        #log div.good { color: #8ce99a; }
+        #log div.head { color: #9ecbff; }
     </style>
     <!-- pdf.js と pdf-lib のCDN -->
     <script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.min.js"></script>
@@ -292,7 +386,7 @@ const FRONT_HTML = `<!DOCTYPE html>
 
 <div class="container">
     <h1>📄 PDFセパレーター自動分割ツール</h1>
-    
+
     <div class="controls">
         <div class="form-group">
             <label for="prefixInput">🏷️ ファイル名の接頭語（自由入力）</label>
@@ -311,51 +405,137 @@ const FRONT_HTML = `<!DOCTYPE html>
             </label>
             <div class="note">接頭語_手術日_患者番号_<b>患者名</b>.pdf の形式になります。外すと患者名なしで出力します。</div>
         </div>
-        
+
         <button id="processBtn" disabled>🚀 解析と分割を開始</button>
+        <button id="resplitBtn" class="sub" disabled>🔁 再分割のみ（AIに問い直さない）</button>
+        <div class="note">分割やダウンロードだけ失敗したときは、こちらで作り直せます。AIへの問い合わせが発生しないので追加費用もかかりません。</div>
+
+        <div class="bar" id="bar"><i id="barFill"></i></div>
+        <div class="barlabel" id="barLabel"></div>
     </div>
 
-    <div id="log">待機中... PDFを選択してください。</div>
+    <div id="log"></div>
 </div>
 
 <script>
+    // ========================================================
+    // 動作設定
+    // ========================================================
+    const RENDER_SCALE   = 1.5;     // ページを画像にするときの倍率
+    const CROP_RATIO     = 0.40;    // ページ上部の何割をAIに送るか
+    const JPEG_QUALITY   = 0.8;
+    const MAX_ATTEMPTS   = 5;       // 1ページあたりの試行回数（初回＋再試行4回）
+    const RETRY_BASE_MS  = 1500;    // 再試行までの待ち時間の基準
+    const RETRY_CAP_MS   = 30000;   // 待ち時間の上限
+    const REQ_TIMEOUT_MS = 60000;   // 1回の問い合わせを待つ上限
+    const PAGE_GAP_MS    = 120;     // 連続送信の間隔（レート制限を避ける）
+    const DL_GAP_MS      = 600;     // 連続ダウンロードの間隔
+    const BIG_FILE_MB    = 150;     // これを超えたら注意を表示
+    const LOG_MAX_LINES  = 600;     // ログの保持行数
+
     // PDF.jsのワーカー設定
     pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/2.16.105/pdf.worker.min.js';
 
-    const pdfInput = document.getElementById('pdfInput');
+    const pdfInput    = document.getElementById('pdfInput');
     const prefixInput = document.getElementById('prefixInput');
-    const useNameInput = document.getElementById('useNameInput');
-    const processBtn = document.getElementById('processBtn');
-    const logDiv = document.getElementById('log');
+    const useNameInput= document.getElementById('useNameInput');
+    const processBtn  = document.getElementById('processBtn');
+    const resplitBtn  = document.getElementById('resplitBtn');
+    const logDiv      = document.getElementById('log');
+    const bar         = document.getElementById('bar');
+    const barFill     = document.getElementById('barFill');
+    const barLabel    = document.getElementById('barLabel');
 
     let selectedFile = null;
-    let pdfBytes = null;
+    let pdfBytes     = null;     // 元PDFのArrayBuffer
+    let lastGroups   = null;     // 直前の解析結果（再分割用に保持）
+    let busy         = false;
 
-    function log(message) {
-        const time = new Date().toLocaleTimeString();
-        logDiv.innerHTML += \`[\${time}] \${message}<br>\`;
+    // ========================================================
+    // ログ
+    //   innerHTMLの連結はやめてappendChildにしている。
+    //   120ページだと数百行になり、連結だと毎回HTML全体を作り直して重くなるため。
+    //   あわせてtextContentで入れるので、AIが返した文字列が
+    //   HTMLとして解釈されることもない。
+    // ========================================================
+    function log(message, cls) {
+        const line = document.createElement('div');
+        if (cls) line.className = cls;
+        line.textContent = '[' + new Date().toLocaleTimeString() + '] ' + message;
+        logDiv.appendChild(line);
+        while (logDiv.childElementCount > LOG_MAX_LINES) logDiv.removeChild(logDiv.firstChild);
         logDiv.scrollTop = logDiv.scrollHeight;
+    }
+    function hr() { log('----------------------------------------'); }
+    log('待機中... PDFを選択してください。');
+
+    function showBar(show) {
+        bar.style.display      = show ? 'block' : 'none';
+        barLabel.style.display = show ? 'block' : 'none';
+    }
+    function setBar(done, total, text) {
+        const pct = total > 0 ? Math.round(done / total * 100) : 0;
+        barFill.style.width = pct + '%';
+        barLabel.textContent = text || (done + ' / ' + total + '（' + pct + '%）');
+    }
+
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+    function fmtSec(s) {
+        if (!isFinite(s) || s < 0) return '—';
+        if (s < 60) return Math.round(s) + '秒';
+        const m = Math.floor(s / 60);
+        return m + '分' + String(Math.round(s % 60)).padStart(2, '0') + '秒';
+    }
+
+    // ========================================================
+    // ファイル選択
+    //   読み込みが終わるまでボタンを押させない。
+    //   以前は読み込みを待たずに有効化していたので、大きいファイルだと
+    //   押しても何も起きないことがあった。
+    // ========================================================
+    function readFileAsArrayBuffer(file) {
+        return new Promise((resolve, reject) => {
+            const reader = new FileReader();
+            reader.onload  = () => resolve(reader.result);
+            reader.onerror = () => reject(new Error('ファイルを読み込めませんでした'));
+            reader.readAsArrayBuffer(file);
+        });
     }
 
     pdfInput.addEventListener('change', async (e) => {
-        if (e.target.files.length > 0) {
-            selectedFile = e.target.files[0];
+        if (!e.target.files.length) return;
+        selectedFile = e.target.files[0];
+        pdfBytes   = null;
+        lastGroups = null;
+        processBtn.disabled = true;
+        resplitBtn.disabled = true;
+
+        const mb = selectedFile.size / 1048576;
+        log('ファイルを選択しました: ' + selectedFile.name + '（' + mb.toFixed(1) + ' MB）', 'head');
+        log('読み込み中です。しばらくお待ちください...');
+
+        try {
+            pdfBytes = await readFileAsArrayBuffer(selectedFile);
+            log('読み込み完了。開始できます。', 'good');
+            if (mb > BIG_FILE_MB) {
+                log('⚠ 大きいファイルです。ページ数が多いと時間がかかります。'
+                  + '途中でAPIが混み合った場合は自動で待って再試行します。', 'warn');
+            }
             processBtn.disabled = false;
-            log(\`ファイルを選択しました: \${selectedFile.name}\`);
-            
-            const reader = new FileReader();
-            reader.onload = function(evt) {
-                pdfBytes = evt.target.result;
-            };
-            reader.readAsArrayBuffer(selectedFile);
+        } catch (err) {
+            log('❌ ' + err.message, 'bad');
         }
     });
+
+    // ========================================================
+    // 文字列の整形
+    // ========================================================
 
     // 患者IDを6桁にそろえる
     //   院内の手術伝票は 0000513572 のように0埋めされた10桁、
     //   手術伝票プラスは 513572 のように0埋めなしで印字されるため、
     //   どちらから読んでも同じ 513572 になるように下6桁で統一する。
-    //   手術伝票プラス側の表示・ファイル名も同じ6桁にそろえてある。
     function patientId6(s) {
         const d = String(s || "").replace(/[^0-9]/g, "");
         if (!d) return "";
@@ -383,158 +563,339 @@ const FRONT_HTML = `<!DOCTYPE html>
             .trim();
     }
 
-    // Workers上のAPIを呼び出す関数
-    async function recognizeImageByAPI(base64Image) {
-        const res = await fetch('/api/recognize', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ image: base64Image })
-        });
-        const json = await res.json();
-        if (!json.ok) throw new Error(json.error);
-        return json.data;
+    // ========================================================
+    // AIへの問い合わせ（再試行つき）
+    //   429（混雑）や5xx（一時障害）、通信エラー、タイムアウトは
+    //   待ってから何度か試す。ここが無かったために、途中で1回失敗すると
+    //   それまでの解析がすべて無駄になっていた。
+    // ========================================================
+    function backoffMs(attempt) {
+        const base = Math.min(RETRY_CAP_MS, RETRY_BASE_MS * Math.pow(2, attempt - 1));
+        return base + Math.floor(Math.random() * 500);   // 少しばらして同時再開を避ける
     }
 
-    processBtn.addEventListener('click', async () => {
-        if (!pdfBytes) return;
-        processBtn.disabled = true;
-        const prefix = prefixInput.value.trim();
-        log('--- 処理を開始します ---');
-        if (prefix) log(\`接頭語 [\${prefix}] を適用します\`);
+    async function recognizePage(base64Image, pageNum) {
+        let lastErr = null;
 
+        for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
+            const ac = new AbortController();
+            const timer = setTimeout(() => ac.abort(), REQ_TIMEOUT_MS);
+            let res = null, json = null, netErr = null;
+
+            try {
+                res = await fetch('/api/recognize', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ image: base64Image }),
+                    signal: ac.signal
+                });
+                try { json = await res.json(); } catch (e) { json = null; }
+            } catch (e) {
+                netErr = e;
+            }
+            clearTimeout(timer);
+
+            // 成功
+            if (!netErr && res && res.ok && json && json.ok) return json.data;
+
+            // 失敗の種類を見分ける
+            let retryable, label;
+            if (netErr) {
+                const aborted = netErr.name === 'AbortError';
+                retryable = true;
+                label = aborted ? '応答なし（' + Math.round(REQ_TIMEOUT_MS / 1000) + '秒待っても返らず）' : '通信エラー';
+                lastErr = new Error(label);
+            } else {
+                const st = res ? res.status : 0;
+                const msg = (json && json.error) ? String(json.error) : ('HTTP ' + st);
+                retryable = (json && typeof json.retryable === 'boolean')
+                    ? json.retryable
+                    : (st === 429 || st === 408 || st >= 500);
+                label = (st === 429 ? 'API混雑（429）' : 'エラー（' + st + '）') + ' ' + msg.slice(0, 160);
+                lastErr = new Error(msg.slice(0, 300));
+            }
+
+            if (!retryable || attempt === MAX_ATTEMPTS) {
+                if (!retryable) log('   ページ ' + pageNum + ': ' + label + ' ／ 再試行しても直らない種類のエラーです', 'bad');
+                break;
+            }
+
+            // Retry-Afterの指示があればそれに従う
+            let wait = backoffMs(attempt);
+            const ra = res ? Number(res.headers.get('Retry-After')) : 0;
+            if (ra > 0) wait = Math.min(RETRY_CAP_MS, ra * 1000) + 300;
+
+            log('   ⏳ ページ ' + pageNum + ': ' + label
+              + ' ／ ' + Math.round(wait / 1000) + '秒待って再試行します（'
+              + attempt + '/' + (MAX_ATTEMPTS - 1) + '回目）', 'warn');
+            await sleep(wait);
+        }
+
+        throw lastErr || new Error('不明なエラー');
+    }
+
+    // ========================================================
+    // 1ページを画像にする
+    //   使い終わったキャンバスはすぐ解放する。
+    //   ページ数が多いと解放しないぶんがメモリに残り続けるため。
+    // ========================================================
+    async function pageToDataUrl(pdfDocument, pageNum) {
+        const page = await pdfDocument.getPage(pageNum);
         try {
-            // PDFの読み込み
-            const loadingTask = pdfjsLib.getDocument({ data: pdfBytes });
-            const pdfDocument = await loadingTask.promise;
-            const totalPages = pdfDocument.numPages;
-            log(\`PDF総ページ数: \${totalPages}ページ\`);
+            const viewport = page.getViewport({ scale: RENDER_SCALE });
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
 
-            const pdfDocLib = await PDFLib.PDFDocument.load(pdfBytes);
+            // 上部だけを切り取る（「手術伝票」のタイトル部分を含めるため）
+            //   viewport には既に scale が掛かっているので、ここで transform を
+            //   重ねると倍率が二重（1.5×1.5=2.25倍）になり、用紙の左上しか写らない。
+            //   右端にある「手術日」が画角から外れて読めなくなるため transform は渡さない。
+            //   キャンバスを低くしておくことで、はみ出した下部は描かれない。
+            canvas.width  = Math.floor(viewport.width);
+            canvas.height = Math.floor(viewport.height * CROP_RATIO);
 
-            let groups = []; 
-            let currentGroup = null;
+            await page.render({ canvasContext: ctx, viewport: viewport }).promise;
+            const url = canvas.toDataURL('image/jpeg', JPEG_QUALITY);
 
-            // 1ページずつ解析してグループ分け
-            for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
-                log(\`----------------------------------------\`);
-                log(\`ページ \${pageNum} を解析中...\`);
-                const page = await pdfDocument.getPage(pageNum);
-                
-                const scale = 1.5;
-                const viewport = page.getViewport({ scale: scale });
+            canvas.width = 0; canvas.height = 0;        // 解放
+            return url;
+        } finally {
+            try { page.cleanup(); } catch (e) {}
+        }
+    }
 
-                const canvas = document.createElement('canvas');
-                const ctx = canvas.getContext('2d');
-                
-                // 上部40%だけを切り取る (「手術伝票」のタイトル部分を含めるため)
-                //   viewport には既に scale が掛かっているので、ここで transform を
-                //   重ねると倍率が二重（1.5×1.5=2.25倍）になり、用紙の左上しか写らない。
-                //   右端にある「手術日」が画角から外れて読めなくなるため transform は渡さない。
-                const cropWidth = viewport.width;
-                const cropHeight = viewport.height * 0.4;
-                canvas.width = cropWidth;
-                canvas.height = cropHeight;
+    // ========================================================
+    // 解析（AIに1ページずつ聞いてグループに分ける）
+    // ========================================================
+    async function analyze(pdfDocument, totalPages) {
+        const groups = [];
+        const failed = [];
+        let currentGroup = null;
+        const t0 = Date.now();
 
-                await page.render({
-                    canvasContext: ctx,
-                    viewport: viewport
-                }).promise;
+        for (let pageNum = 1; pageNum <= totalPages; pageNum++) {
+            const imageData = await pageToDataUrl(pdfDocument, pageNum);
 
-                const imageData = canvas.toDataURL('image/jpeg', 0.8);
+            let aiResult;
+            try {
+                aiResult = await recognizePage(imageData, pageNum);
+            } catch (e) {
+                // ここまで粘って駄目だったページ。
+                // 処理は止めず「直前のセットの続き」として扱う。
+                //   勝手に新しい区切りを作るより、まとまってしまうほうが
+                //   後からページ数のズレで気づけるため。
+                failed.push({ page: pageNum, reason: e.message });
+                log('❌ ページ ' + pageNum + ' は読み取れませんでした（' + e.message.slice(0, 120) + '）', 'bad');
+                log('   直前のセットの続きとして扱います。最後にまとめて報告します。', 'bad');
+                aiResult = { isFirstPage: false, patientId: '', patientName: '', title: '', date: '' };
+            }
 
-                // AIへ送信
-                log('☁️ AI(API)へ画像を送信中...');
-                const aiResult = await recognizeImageByAPI(imageData);
-
-                log(\`🔍 認識結果: 手術伝票=\${aiResult.isFirstPage ? 'はい' : 'いいえ'}, 手術日=\${aiResult.date || 'なし'}, ID=\${aiResult.patientId || 'なし'}, 氏名=\${aiResult.patientName || 'なし'}\`);
-
-                // 「手術伝票」という文字が見つかった場合 ＝ 新しいセットの始まり
-                if (aiResult.isFirstPage) {
-                    log(\`✨ 新しい手術伝票を検知: ページ \${pageNum}\`);
-
-                    // すでに作成中のグループがあれば、リストに保存
-                    if (currentGroup && currentGroup.pages.length > 0) {
-                        groups.push(currentGroup);
-                    }
-
-                    // 新しいグループを作成
-                    currentGroup = {
-                        id: aiResult.patientId || "不明ID",
-                        name: aiResult.patientName || "",
-                        title: aiResult.title || "記録用紙",
-                        date: aiResult.date || "日付不明",
-                        pages: [pageNum - 1] // pdf-libのページインデックスは0始まり
-                    };
+            if (aiResult.isFirstPage) {
+                if (currentGroup && currentGroup.pages.length > 0) groups.push(currentGroup);
+                currentGroup = {
+                    id:    aiResult.patientId   || "不明ID",
+                    name:  aiResult.patientName || "",
+                    title: aiResult.title       || "記録用紙",
+                    date:  aiResult.date        || "日付不明",
+                    pages: [pageNum - 1]        // pdf-libのページインデックスは0始まり
+                };
+                log('✨ ページ ' + pageNum + ': 新しい手術伝票'
+                  + '（番号 ' + (patientId6(aiResult.patientId) || '不明')
+                  + ' / ' + (aiResult.date || '日付不明') + '）', 'good');
+            } else {
+                if (currentGroup) {
+                    currentGroup.pages.push(pageNum - 1);
                 } else {
-                    // 「手術伝票」ではない場合 ＝ 今のセットの続き（次のIDの前まで）
-                    if (currentGroup) {
-                        currentGroup.pages.push(pageNum - 1);
-                        log(\`📄 今のセットにページを追加しました。\`);
-                    } else {
-                        // 最初から「手術伝票」がないページが出た場合のフェイルセーフ
-                        currentGroup = {
-                            id: "不明ID",
-                            name: "",
-                            title: "記録用紙",
-                            date: "日付不明",
-                            pages: [pageNum - 1]
-                        };
-                        log(\`⚠ 先頭ページが「手術伝票」ではありません。不明グループとして開始します。\`);
-                    }
+                    // 先頭から「手術伝票」でないページが出た場合のフェイルセーフ
+                    currentGroup = { id: "不明ID", name: "", title: "記録用紙", date: "日付不明", pages: [pageNum - 1] };
+                    log('⚠ 先頭ページが「手術伝票」ではありません。不明グループとして開始します。', 'warn');
                 }
             }
 
-            // 最後のグループを保存
-            if (currentGroup && currentGroup.pages.length > 0) {
-                groups.push(currentGroup);
-            }
+            const elapsed = (Date.now() - t0) / 1000;
+            const eta = elapsed / pageNum * (totalPages - pageNum);
+            setBar(pageNum, totalPages,
+                '解析 ' + pageNum + ' / ' + totalPages + ' ページ　残り約 ' + fmtSec(eta));
 
-            log('----------------------------------------');
-            log('解析完了。ファイルの分割・作成を開始します。');
+            if (pageNum < totalPages && PAGE_GAP_MS > 0) await sleep(PAGE_GAP_MS);
+        }
 
-            // グループごとにPDFを生成・ダウンロード
-            for (let i = 0; i < groups.length; i++) {
-                const group = groups[i];
-                log(\`ファイル作成中... (\${patientId6(group.id) || group.id} : 計\${group.pages.length}ページ)\`);
+        if (currentGroup && currentGroup.pages.length > 0) groups.push(currentGroup);
+        return { groups, failed };
+    }
 
-                const newPdf = await PDFLib.PDFDocument.create();
-                const copiedPages = await newPdf.copyPages(pdfDocLib, group.pages);
-                copiedPages.forEach((page) => newPdf.addPage(page));
+    // ========================================================
+    // 分割して保存
+    // ========================================================
+    async function splitAndDownload(groups, prefix) {
+        // 念のための確認。pdf.jsに渡したバッファが解放されていると0になる
+        if (!pdfBytes || pdfBytes.byteLength === 0) {
+            throw new Error('元PDFのデータが失われています。ファイルを選び直してください。');
+        }
+        // 分割用にここで初めてpdf-libに読ませる（解析中は抱えない）
+        const pdfDocLib = await PDFLib.PDFDocument.load(pdfBytes);
+        let ok = 0;
 
-                const newPdfBytes = await newPdf.save();
+        for (let i = 0; i < groups.length; i++) {
+            const group = groups[i];
+            setBar(i, groups.length, 'ファイル作成 ' + (i + 1) + ' / ' + groups.length);
 
-                // ファイル名の組み立て（接頭語_手術日_患者ID_患者名.pdf）
-                //   患者名はチェックが入っている時だけ。読み取れなかった項目は飛ばす。
-                const safeName = useNameInput.checked ? cleanForName(group.name) : "";
+            const newPdf = await PDFLib.PDFDocument.create();
+            const copiedPages = await newPdf.copyPages(pdfDocLib, group.pages);
+            copiedPages.forEach((page) => newPdf.addPage(page));
+            const newPdfBytes = await newPdf.save();
 
-                const parts = [];
-                if (prefix)     parts.push(cleanForName(prefix));
-                if (group.date) parts.push(ymd8(group.date));
-                if (group.id)   parts.push(patientId6(group.id) || cleanForName(group.id));
-                if (safeName)   parts.push(safeName);
+            // ファイル名の組み立て（接頭語_手術日_患者ID_患者名.pdf）
+            //   患者名はチェックが入っている時だけ。読み取れなかった項目は飛ばす。
+            const safeName = useNameInput.checked ? cleanForName(group.name) : "";
+            const parts = [];
+            if (prefix)     parts.push(cleanForName(prefix));
+            if (group.date) parts.push(ymd8(group.date));
+            if (group.id)   parts.push(patientId6(group.id) || cleanForName(group.id));
+            if (safeName)   parts.push(safeName);
+            const fileName = (parts.filter(Boolean).join("_") || "記録用紙") + ".pdf";
 
-                let fileName = (parts.filter(Boolean).join("_") || "記録用紙") + ".pdf";
+            // ダウンロード。Blob URLは使い終わったら解放する
+            //   解放しないと出力したPDFがすべてメモリに残り続ける。
+            const blob = new Blob([newPdfBytes], { type: 'application/pdf' });
+            const url  = URL.createObjectURL(blob);
+            const link = document.createElement('a');
+            link.href = url;
+            link.download = fileName;
+            link.click();
+            setTimeout(() => URL.revokeObjectURL(url), 60000);
 
-                // ダウンロード処理
-                const blob = new Blob([newPdfBytes], { type: 'application/pdf' });
-                const link = document.createElement('a');
-                link.href = URL.createObjectURL(blob);
-                link.download = fileName;
-                link.click();
+            log('✅ 出力完了: ' + fileName + '（' + group.pages.length + 'ページ）', 'good');
+            ok++;
 
-                log(\`✅ 出力完了: \${fileName}\`);
-                
-                // 連続ダウンロードがブラウザにブロックされないよう待機
-                await new Promise(resolve => setTimeout(resolve, 600));
-            }
+            // 連続ダウンロードがブラウザにブロックされないよう待機
+            if (i < groups.length - 1) await sleep(DL_GAP_MS);
+        }
+        setBar(groups.length, groups.length, 'ファイル作成 完了');
+        return ok;
+    }
 
-            log('🎉 すべての処理が完了しました！');
+    // ========================================================
+    // 最後の報告
+    // ========================================================
+    function report(groups, failed, totalPages) {
+        hr();
+        log('■ 結果', 'head');
+        log('　ページ数 ' + totalPages + ' ／ 出力ファイル ' + groups.length + ' 件');
+
+        const sum = groups.reduce((a, g) => a + g.pages.length, 0);
+        if (sum !== totalPages) {
+            log('⚠ ページ数の合計（' + sum + '）が元PDF（' + totalPages + '）と一致しません。確認してください。', 'warn');
+        }
+
+        if (failed.length) {
+            log('⚠ 読み取れなかったページが ' + failed.length + ' 件あります。', 'warn');
+            failed.forEach(f => log('　・ページ ' + f.page + '：' + String(f.reason).slice(0, 120), 'warn'));
+            log('　これらのページは直前のセットに入っています。', 'warn');
+            log('　該当するファイルのページ数を確認し、必要なら手で分けてください。', 'warn');
+            log('　そのうえでもう一度やり直す場合は「解析と分割を開始」を押し直してください。', 'warn');
+        } else {
+            log('🎉 すべてのページを読み取れました。', 'good');
+        }
+
+        log('ファイル名の一覧を確認し、同じ患者番号が並んでいないか見ておいてください。');
+    }
+
+    // ========================================================
+    // 本処理
+    // ========================================================
+    processBtn.addEventListener('click', async () => {
+        if (busy) return;
+        if (!pdfBytes) { log('⚠ まだファイルの読み込みが終わっていません。', 'warn'); return; }
+
+        busy = true;
+        processBtn.disabled = true;
+        resplitBtn.disabled = true;
+        showBar(true);
+        const prefix = prefixInput.value.trim();
+
+        hr();
+        log('--- 処理を開始します ---', 'head');
+        if (prefix) log('接頭語 [' + prefix + '] を適用します');
+
+        const tAll = Date.now();
+        let pdfDocument = null;
+
+        try {
+            // pdf.jsには「ビュー」を渡す（コピーは作らない）。
+            //   このバージョンのpdf.jsは渡したArrayBufferを奪わないので、
+            //   あとで pdf-lib に同じものを渡せる。コピーを作ると元PDFと
+            //   同じ容量をもう一つ抱えることになり、大きいファイルで不利。
+            const loadingTask = pdfjsLib.getDocument({ data: new Uint8Array(pdfBytes) });
+            pdfDocument = await loadingTask.promise;
+            const totalPages = pdfDocument.numPages;
+            log('PDF総ページ数: ' + totalPages + 'ページ', 'head');
+
+            const { groups, failed } = await analyze(pdfDocument, totalPages);
+
+            hr();
+            log('解析完了。' + groups.length + '件に分かれました。', 'head');
+            groups.forEach((g, i) => {
+                log('　' + (i + 1) + '. 番号 ' + (patientId6(g.id) || g.id)
+                  + ' ／ ' + (g.date || '日付不明')
+                  + ' ／ ' + g.pages.length + 'ページ');
+            });
+
+            // 解析結果を残す。分割だけ失敗したときにAIへ問い直さず作り直せる
+            lastGroups = groups;
+            resplitBtn.disabled = false;
+
+            // 解析が終わればpdf.js側はもう使わない。
+            //   元PDFと同じ容量をpdf.jsのワーカーが抱えているので、
+            //   分割（pdf-lib）を始める前に解放してピークを下げる。
+            try { await pdfDocument.destroy(); } catch (e) {}
+            pdfDocument = null;
+
+            hr();
+            log('ファイルの分割・作成を開始します。');
+            await splitAndDownload(groups, prefix);
+
+            report(groups, failed, totalPages);
+            log('所要時間 ' + fmtSec((Date.now() - tAll) / 1000), 'head');
 
         } catch (error) {
-            log(\`❌ エラーが発生しました: \${error.message}\`);
+            const msg = (error && error.message) ? error.message : String(error);
+            log('❌ 処理を中断しました: ' + msg, 'bad');
+            if (lastGroups) {
+                log('解析結果は保持しています。「再分割のみ」で作り直せます（追加費用なし）。', 'warn');
+            }
+            console.error(error);
+        } finally {
+            if (pdfDocument) { try { await pdfDocument.destroy(); } catch (e) {} }
+            processBtn.disabled = false;
+            // 解析結果が残っていれば再分割できる状態に戻す
+            resplitBtn.disabled = !lastGroups;
+            busy = false;
+        }
+    });
+
+    // 解析をやり直さずに分割だけ作り直す
+    resplitBtn.addEventListener('click', async () => {
+        if (busy) return;
+        if (!lastGroups || !pdfBytes) { log('⚠ 保持している解析結果がありません。', 'warn'); return; }
+
+        busy = true;
+        processBtn.disabled = true;
+        resplitBtn.disabled = true;
+        showBar(true);
+
+        hr();
+        log('--- 再分割します（AIへの問い合わせはしません） ---', 'head');
+        try {
+            const n = await splitAndDownload(lastGroups, prefixInput.value.trim());
+            log('🎉 ' + n + '件を作り直しました。', 'good');
+        } catch (error) {
+            log('❌ 再分割に失敗しました: ' + ((error && error.message) || String(error)), 'bad');
             console.error(error);
         } finally {
             processBtn.disabled = false;
+            resplitBtn.disabled = false;
+            busy = false;
         }
     });
 </script>
